@@ -1,0 +1,6 @@
+# 统一 LF：这是要发布到 npm 的包，换行符不该随检出平台变化。
+* text=auto eol=lf
+
+# 二进制资源不参与换行转换
+*.png binary
+*.tgz binary

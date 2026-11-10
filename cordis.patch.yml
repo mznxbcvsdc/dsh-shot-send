@@ -1,0 +1,5 @@
+# dsh-shot-send bundle patch: one insert over the profile root.
+# 宿主半注册两条 HTTP 路由（框选 / 诊断）；浏览器半在输入框右侧挂一个相机按钮。
+- insert:
+    - id: dsh-shot-send
+      name: 'dsh-shot-send'

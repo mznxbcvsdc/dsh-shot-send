@@ -1,0 +1,72 @@
+{
+  "name": "dsh-shot-send",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (DSH) 桌面端截图提问：框选屏幕任意区域，图片直接落进当前会话输入框。抓屏与框选全程在内存完成，不产生本地图片文件。",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mznxbcvsdc/dsh-shot-send.git"
+  },
+  "homepage": "https://github.com/mznxbcvsdc/dsh-shot-send#readme",
+  "bugs": {
+    "url": "https://github.com/mznxbcvsdc/dsh-shot-send/issues"
+  },
+  "author": "wwmww <2297391382@qq.com>",
+  "type": "module",
+  "main": "lib/index.js",
+  "icon": "./icon.png",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "files": [
+    "lib",
+    "runtime",
+    "src",
+    "scripts",
+    "tests",
+    "cordis.patch.yml",
+    "icon.png",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "verify": "node scripts/verify.mjs",
+    "test": "node --test tests/",
+    "check": "node scripts/build.mjs && node scripts/verify.mjs && node --test tests/"
+  },
+  "engines": {
+    "node": "^22.19 || >=24",
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "os": [
+    "win32"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "screenshot",
+    "capture",
+    "截图",
+    "截图提问"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}
