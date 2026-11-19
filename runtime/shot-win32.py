@@ -12,6 +12,22 @@
 与带标注的完整版相比：没有工具条、没有颜色、没有撤销——框完就走。
 这让浮层只剩一件事要正确，也为插件市场留一个最小的维护面。
 
+取消键（Esc 为什么曾经无效）
+    浮层是无边框（overrideredirect）的置顶窗口。Windows 不会因为 Tk 的 focus_force()
+    就把键盘焦点交给它——实测 GetForegroundWindow() 仍停在别的窗口上，于是按键事件
+    压根到不了浮层；右键却照旧好用（鼠标按命中测试投递，与焦点无关）。所以这里把
+    取消做成两条路：
+      · 尽力抢前台（AttachThreadInput + SetForegroundWindow），抢到就由 Tk 绑定收键；
+      · 无论抢没抢到，每 20 ms 读一次物理键状态（GetAsyncKeyState），按住 Esc 即取消。
+    后者不依赖焦点，是兜底的那条；右键照旧保留。
+
+窗口时序（「闪一下」与那段黑屏）
+    以前最小化后等抓屏一完成就恢复窗口，于是窗口先弹回来、几百毫秒后才被浮层盖住——
+    那就是用户看到的「闪一下」。现在恢复推迟到浮层关闭之后（try/finally），而浮层本身
+    要等冻结帧编码好才显示：那 0.2~0.35 s 里屏幕上是桌面（DSH 已收起），接着同一块桌面
+    变暗成冻结帧，切换几乎无缝，既没有窗口闪回，也没有黑屏过场。
+    代价：点下去到浮层出现约 0.3~0.4 s，这段时间里没有可取消的东西（Esc/右键要等浮层出来）。
+
 环境变量：
     DSH_SHOT_HIDE=0     截图前不最小化本应用窗口
     DSH_SHOT_HIDE=dry   只报告隐藏决策（诊断用）
@@ -23,7 +39,9 @@
     4  无可用显示
     5  运行环境不可用（缺 ctypes / tkinter）
 
-自检：python shot-win32.py --selftest   （不开窗口，只跑纯函数断言）
+自检：python shot-win32.py --selftest        （不开窗口，只跑纯函数断言）
+      python shot-win32.py --selftest-focus  （开浮层，700 ms 后报告前台归属并取消）
+      python shot-win32.py --selftest-shot out.png   （抓下用户视角的浮层画面）
 """
 
 import base64
@@ -45,6 +63,8 @@ SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
 SW_MINIMIZE, SW_RESTORE = 6, 9
 TH32CS_SNAPPROCESS = 0x00000002
 MAX_PATH = 260
+VK_ESCAPE = 0x1B
+KEY_PRESSED = 0x8000
 
 # ---------- 交互常量 ----------
 
@@ -52,6 +72,13 @@ MIN_SELECT = 8
 DIM_LEVEL = 0.42
 FONT = ("Microsoft YaHei UI", 13)
 FONT_HINT = ("Microsoft YaHei UI", 14)
+HINT_TEXT = "拖拽框选，松手即完成 · Esc 取消"
+# 取消键轮询间隔：20 ms 够快（60 Hz 的一帧）而又几乎不占 CPU。
+ESCAPE_POLL_MS = 20
+# 最小化动画的收尾等待：IsIconic 在动画刚开始就为真，抓屏要等它真的退场。
+MINIMIZE_SETTLE = 0.22
+# 抢前台的几次尝试（毫秒）。窗口刚映射时 Win32 可能还没准备好接受激活。
+FOREGROUND_RETRIES = (0, 80, 240)
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -152,6 +179,84 @@ def load_libraries():
         raise SystemExit(5)
 
 
+def declare_signatures(user32, kernel32):
+    """显式声明签名：HWND 在 64 位下是指针，默认的 int 参数/返回值会被截断。"""
+    user32.GetForegroundWindow.restype = wt.HWND
+    user32.GetParent.argtypes = [wt.HWND]
+    user32.GetParent.restype = wt.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wt.DWORD
+    user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+    user32.AttachThreadInput.restype = wt.BOOL
+    user32.SetForegroundWindow.argtypes = [wt.HWND]
+    user32.SetForegroundWindow.restype = wt.BOOL
+    user32.SetFocus.argtypes = [wt.HWND]
+    user32.SetFocus.restype = wt.HWND
+    user32.BringWindowToTop.argtypes = [wt.HWND]
+    user32.SetActiveWindow.argtypes = [wt.HWND]
+    user32.IsIconic.argtypes = [wt.HWND]
+    user32.IsIconic.restype = wt.BOOL
+    user32.IsWindowVisible.argtypes = [wt.HWND]
+    user32.IsWindowVisible.restype = wt.BOOL
+    user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wt.BOOL
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    kernel32.GetCurrentThreadId.restype = wt.DWORD
+
+
+def escape_pressed(user32):
+    """物理 Esc 是否正被按住。
+
+    这条通道与键盘焦点无关：浮层抢不到前台时，Tk 的 <Escape> 绑定收不到任何按键，
+    但 GetAsyncKeyState 读的是全局按键状态，照样能看见 Esc。
+    """
+    return bool(user32.GetAsyncKeyState(VK_ESCAPE) & KEY_PRESSED)
+
+
+def toplevel_hwnd(root, user32):
+    """浮层的 Win32 顶层句柄：优先 wm frame，退回 winfo_id 的父窗口。"""
+    try:
+        frame = root.frame()
+        if frame:
+            return int(frame, 16)
+    except Exception:  # noqa: BLE001 - 窗口尚未映射时 Tcl 也会抛
+        pass
+    try:
+        parent = user32.GetParent(root.winfo_id())
+    except Exception:  # noqa: BLE001
+        parent = 0
+    return parent or root.winfo_id()
+
+
+def claim_foreground(user32, kernel32, hwnd):
+    """尽力把浮层做成前台窗口。
+
+    拿到前台的意义不只是 Esc：前台窗口才收得到键盘，快捷键才不会漏给背后的应用。
+    拿不到也不算失败——取消键另有不依赖焦点的轮询通道。
+    """
+    if not hwnd:
+        return False
+    foreground = user32.GetForegroundWindow()
+    if foreground == hwnd:
+        return True
+    current_tid = kernel32.GetCurrentThreadId()
+    target_tid = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    attached = False
+    if target_tid and target_tid != current_tid:
+        # 把输入队列挂到前台线程上，SetForegroundWindow 才不会被前台锁拒掉。
+        attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetFocus(hwnd)
+        user32.SetActiveWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(current_tid, target_tid, False)
+    return user32.GetForegroundWindow() == hwnd
+
+
 def ancestor_pids(kernel32, start=None):
     """从当前进程向上回溯的 PID 集合（含自身）。"""
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -226,41 +331,51 @@ def grab(user32, gdi32, x, y, w, h):
 # ============================================================
 
 class ShotOverlay:
-    """全屏置顶浮层：压暗底图 + 选区内还原原色，松手即完成。"""
+    """全屏置顶浮层：压暗底图 + 选区内还原原色，松手即完成。
 
-    def __init__(self, root, dim_photo, bright_photo, w, h):
+    窗口显示之前就把冻结帧交给 set_frames()——浮层一露面就是成品画面，没有待命黑底。
+    """
+
+    def __init__(self, root, w, h, user32, kernel32):
         import tkinter as tk
         self.tk = tk
         self.root = root
+        self.user32 = user32
+        self.kernel32 = kernel32
         self.w, self.h = w, h
         self.sel = None
         self.drag_from = None
         self.done = False
         self.cancelled = False
         self._hole_photo = None
+        self._dim_photo = None
+        # 冻结帧的「原色源」：set_frames() 之前是 None，此时 reveal 不做还原。
+        self._dim_source = None
+        # None 表示还没读过物理键状态：浮层出现前就按住的 Esc 不算这一次取消。
+        self._escape_down = None
 
         self.canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bd=0,
                                 bg="black", cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
-        # 两个图层：底图＝整屏压暗；亮块＝选区内的原色裁剪。
-        self._dim_source = bright_photo
-        self._dim_photo = dim_photo
-        self.base = self.canvas.create_image(0, 0, anchor="nw", image=dim_photo)
+        # 三个图层：底图＝整屏压暗；亮块＝选区内的原色裁剪；顶部一行操作提示。
+        self.base = self.canvas.create_image(0, 0, anchor="nw")
         self.hole = self.canvas.create_image(0, 0, anchor="nw")
+        self.hint = self.canvas.create_text(w // 2, 46, text=HINT_TEXT, fill="#F2F7FF", font=FONT_HINT)
 
         self.sel_box = self.canvas.create_rectangle(0, 0, 0, 0, outline="#4FC3F7", width=2)
         self.size_bg = self.canvas.create_rectangle(0, 0, 0, 0, fill="#0B1017", outline="")
         self.size_label = self.canvas.create_text(0, 0, text="", anchor="se", fill="#EAF4FF", font=FONT)
-        self.hint = self.canvas.create_text(w // 2, 46, text="拖拽框选，松手即完成 · Esc 取消",
-                                            fill="#F2F7FF", font=FONT_HINT)
+        self._hide_chrome()
 
         self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
-        self.canvas.bind("<Button-3>", lambda event: self.cancel())
-        root.bind("<Escape>", lambda event: self.cancel())
-        root.focus_force()
-        self._hide_chrome()
+        # 右键取消：保留（鼠标不依赖键盘焦点）。
+        self.canvas.bind("<Button-3>", self.cancel)
+        # Esc 取消：只绑 all（对任意控件焦点都触发，且一次事件只跑一次回调——
+        # 同时绑 widget/toplevel/all 会在销毁窗口后继续派发，报 command 已失效）。
+        # 抢不到焦点时另由 _poll_escape 兜底。
+        root.bind_all("<Escape>", self.cancel)
 
     # ---- 视觉 ----
 
@@ -268,8 +383,18 @@ class ShotOverlay:
         for item in (self.sel_box, self.size_bg, self.size_label):
             self.canvas.itemconfigure(item, state="hidden")
 
+    def set_frames(self, dim_photo, bright_photo):
+        """冻结帧就位。调用方保证：这一句之后才让窗口显示。"""
+        if self.done or self.cancelled:
+            return
+        self._dim_photo = dim_photo
+        self._dim_source = bright_photo
+        self.canvas.itemconfigure(self.base, image=dim_photo)
+
     def reveal(self, rect):
         """选区内恢复原色：底图是压暗版，这里贴一块原图裁剪。"""
+        if self._dim_source is None:
+            return
         if rect is None:
             self.canvas.itemconfigure(self.hole, image="")
             self._hole_photo = None
@@ -303,6 +428,33 @@ class ShotOverlay:
             self.canvas.tag_raise(self.size_label)
         self.canvas.tag_raise(self.sel_box)
 
+    # ---- 键盘 ----
+
+    def claim_keyboard(self):
+        """把键盘尽量拿过来，并挂上不依赖焦点的 Esc 轮询。"""
+        for delay in FOREGROUND_RETRIES:
+            self.root.after(delay, self._try_foreground)
+        self.root.after(ESCAPE_POLL_MS, self._poll_escape)
+
+    def _try_foreground(self):
+        if self.done or self.cancelled:
+            return
+        claim_foreground(self.user32, self.kernel32, toplevel_hwnd(self.root, self.user32))
+
+    def _poll_escape(self):
+        """浮层期间每 20 ms 看一次物理键：抢不到焦点时这是唯一能收到取消的通道。"""
+        if self.done or self.cancelled:
+            return
+        down = escape_pressed(self.user32)
+        if self._escape_down is None:
+            self._escape_down = down
+        elif down and not self._escape_down:
+            self.cancel()
+            return
+        else:
+            self._escape_down = down
+        self.root.after(ESCAPE_POLL_MS, self._poll_escape)
+
     # ---- 交互 ----
 
     def on_press(self, event):
@@ -332,12 +484,17 @@ class ShotOverlay:
         self.finish()
 
     def finish(self):
+        if self.done or self.cancelled:
+            return
         if not is_selectable(self.sel):
             return
         self.done = True
         self.root.destroy()
 
-    def cancel(self):
+    def cancel(self, *_event):
+        # Esc 绑定与轮询可能同时打进来，只认第一次。
+        if self.done or self.cancelled:
+            return
         self.cancelled = True
         self.root.destroy()
 
@@ -380,6 +537,15 @@ def selftest():
     print("selftest ok")
 
 
+def pump(root):
+    """跑一遍待处理事件；窗口在回调里被销毁时静默返回 False。"""
+    try:
+        root.update()
+    except Exception:  # noqa: BLE001 - TclError: 窗口已销毁
+        return False
+    return True
+
+
 def main():
     if "--selftest" in sys.argv:
         selftest()
@@ -388,12 +554,13 @@ def main():
         raise SystemExit(2)
 
     try:
-        import tkinter  # noqa: F401
+        import tkinter as tk
     except Exception as error:  # noqa: BLE001
         sys.stderr.write(f"tkinter unavailable: {error}\n")
         raise SystemExit(5)
 
     user32, gdi32, kernel32 = load_libraries()
+    declare_signatures(user32, kernel32)
     try:
         user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except (AttributeError, OSError):
@@ -415,55 +582,83 @@ def main():
         sys.stderr.write("no display available (locked session or headless)\n")
         raise SystemExit(4)
 
-    try:
-        if target:
-            user32.ShowWindow(target, SW_MINIMIZE)
-            time.sleep(0.22)
-        raw = grab(user32, gdi32, vx, vy, vw, vh)
-    finally:
-        if target:
-            user32.ShowWindow(target, SW_RESTORE)
-
-    import tkinter as tk
-    bright = base64.b64encode(png_from_bgra(raw, vw, vh, level=1))
-    dimmed = base64.b64encode(png_from_bgra(raw.translate(dim_table()), vw, vh, level=1))
+    # 浮层外壳先建好、但不显示：Tk 首次建窗要一百多毫秒，把它挪到隐藏窗口之前，
+    # 这样冻结帧一编码完就能立刻显示，不必再等建窗。
     root = tk.Tk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
+    root.withdraw()
     gx = vx if vx >= 0 else 0
     gy = vy if vy >= 0 else 0
     root.geometry(f"{vw}x{vh}+{gx}+{gy}")
-    overlay = ShotOverlay(root, tk.PhotoImage(data=dimmed), tk.PhotoImage(data=bright), vw, vh)
+    overlay = ShotOverlay(root, vw, vh, user32, kernel32)
 
-    if "--selftest-ui" in sys.argv:
-        def scripted():
-            overlay.sel = (vx + 300, vy + 200, vx + 900, vy + 600)
-            overlay.reveal(overlay.sel)
-            overlay.draw_selection(overlay.sel)
-            overlay.finish()
+    try:
+        if target:
+            user32.ShowWindow(target, SW_MINIMIZE)
+            time.sleep(MINIMIZE_SETTLE)
+        raw = grab(user32, gdi32, vx, vy, vw, vh)
 
-        root.after(500, scripted)
+        # 先把冻结帧编码好、交给浮层，**之后**才显示窗口：浮层一露面就是成品画面，
+        # 中间那 0.2~0.35 s 屏幕上是桌面（DSH 已收起），不会闪窗口、也不会黑屏。
+        bright = base64.b64encode(png_from_bgra(raw, vw, vh, level=1))
+        dimmed = base64.b64encode(png_from_bgra(raw.translate(dim_table()), vw, vh, level=1))
+        overlay.set_frames(tk.PhotoImage(data=dimmed), tk.PhotoImage(data=bright))
 
-    if "--selftest-shot" in sys.argv:
-        out_path = sys.argv[sys.argv.index("--selftest-shot") + 1]
+        root.deiconify()
+        root.attributes("-topmost", True)
+        root.lift()
+        pump(root)
+        overlay.claim_keyboard()
 
-        def dump():
-            root.update()
-            time.sleep(0.25)
-            shot = grab(user32, gdi32, vx, vy, vw, vh)
-            with open(out_path, "wb") as handle:
-                handle.write(png_from_bgra(shot, vw, vh))
-            root.destroy()
+        if "--selftest-ui" in sys.argv:
+            def scripted():
+                overlay.sel = (vx + 300, vy + 200, vx + 900, vy + 600)
+                overlay.reveal(overlay.sel)
+                overlay.draw_selection(overlay.sel)
+                overlay.finish()
 
-        def prep():
-            overlay.sel = (vx + 300, vy + 200, vx + 900, vy + 600)
-            overlay.reveal(overlay.sel)
-            overlay.draw_selection(overlay.sel)
-            root.after(150, dump)
+            root.after(500, scripted)
 
-        root.after(400, prep)
+        if "--selftest-focus" in sys.argv:
+            def report_focus():
+                hwnd = toplevel_hwnd(root, user32)
+                foreground = user32.GetForegroundWindow()
+                sys.stderr.write(f"focus foreground={foreground} overlay={hwnd} "
+                                 f"match={foreground == hwnd} escape_down={escape_pressed(user32)}\n")
+                overlay.cancel()
 
-    root.mainloop()
+            root.after(700, report_focus)
+
+        if "--selftest-shot" in sys.argv:
+            out_path = sys.argv[sys.argv.index("--selftest-shot") + 1]
+
+            def dump():
+                pump(root)
+                time.sleep(0.25)
+                shot = grab(user32, gdi32, vx, vy, vw, vh)
+                with open(out_path, "wb") as handle:
+                    handle.write(png_from_bgra(shot, vw, vh))
+                overlay.cancel()
+
+            def prep():
+                overlay.sel = (vx + 300, vy + 200, vx + 900, vy + 600)
+                overlay.reveal(overlay.sel)
+                overlay.draw_selection(overlay.sel)
+                root.after(150, dump)
+
+            root.after(400, prep)
+
+        if not overlay.cancelled and not overlay.done:
+            try:
+                root.mainloop()
+            except tk.TclError:
+                pass  # 回调里已经销毁了窗口
+    finally:
+        # 本窗口的最小化一直保持到浮层收场，这里才让它回来——这就是「不再闪一下」。
+        if target:
+            user32.ShowWindow(target, SW_RESTORE)
+            user32.SetForegroundWindow(target)
 
     if overlay.cancelled or not overlay.done or not is_selectable(overlay.sel):
         raise SystemExit(2)
