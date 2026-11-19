@@ -1,6 +1,6 @@
 {
   "name": "dsh-shot-send",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness (DSH) 桌面端截图提问：框选屏幕任意区域，图片直接落进当前会话输入框。抓屏与框选全程在内存完成，不产生本地图片文件。",
   "repository": {
     "type": "git",
