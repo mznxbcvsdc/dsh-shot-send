@@ -1,0 +1,62 @@
+# 发布到 npm：走「可信发布」（trusted publishing / OIDC），不需要任何 npm token 或 2FA 动态码。
+#
+# 前置条件（在 npmjs.com 上登记一次）：
+#   包页面 → Settings → Publishing access → 添加 trusted publisher：
+#     Provider    = GitHub Actions
+#     Owner       = mznxbcvsdc
+#     Repository  = dsh-shot-send
+#     Workflow    = publish.yml
+#     Environment = （留空）
+#
+# 之后发版只剩两步：
+#   1. 改 package.json 的 version（例如 0.1.2）并提交推送；
+#   2. git tag v0.1.2 && git push origin v0.1.2
+# 本工作流校验「tag 与 package.json 版本一致」→ 跑构建与测试 → 发布。
+#
+# 为什么是 windows-latest：本插件只支持 Windows，tests/runtime.test.js 里有两条会真的
+# 调 pickRegion()，在 Linux 上会因平台检查直接抛错；换到 Windows 才能让测试如实通过。
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # OIDC：npm 用这个身份换取一次性的短期发布凭证，不再需要长期 token。
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # 可信发布要求 npm >= 11.5.1
+      - name: 升级 npm
+        shell: bash
+        run: npm install -g npm@latest && npm --version
+
+      - name: 校验 tag 与 package.json 版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          echo "package.json = $version / tag = $tag"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag 与 package.json 的 version 不一致，拒绝发布"
+            exit 1
+          fi
+
+      - name: 构建 + 加载期校验 + 单元测试
+        run: npm run check
+
+      - name: 发布
+        run: npm publish --provenance --access public --registry https://registry.npmjs.org/
