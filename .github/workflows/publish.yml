@@ -11,10 +11,13 @@
 # 之后发版只剩两步：
 #   1. 改 package.json 的 version（例如 0.1.2）并提交推送；
 #   2. git tag v0.1.2 && git push origin v0.1.2
-# 本工作流校验「tag 与 package.json 版本一致」→ 跑构建与测试 → 发布。
+# 本工作流校验「tag 与 package.json 版本一致」→ 构建 → 校验 → 测试 → 发布。
 #
 # 为什么是 windows-latest：本插件只支持 Windows，tests/runtime.test.js 里有两条会真的
 # 调 pickRegion()，在 Linux 上会因平台检查直接抛错；换到 Windows 才能让测试如实通过。
+#
+# 每个阶段都拆开、失败时把日志尾巴写成 ::error:: 注解：仓库 Actions 日志要登录才能看，
+# 而注解是公开可见的，排障不必再问人。
 name: publish
 
 on:
@@ -43,6 +46,15 @@ jobs:
         shell: bash
         run: npm install -g npm@latest && npm --version
 
+      - name: 环境信息（不参与判定）
+        shell: bash
+        run: |
+          echo "node  $(node --version)"
+          echo "npm   $(npm --version)"
+          echo "python $(python --version 2>&1 || echo 不可用)"
+          echo "git   $(git --version)"
+          echo "ref   ${GITHUB_REF_NAME}"
+
       - name: 校验 tag 与 package.json 版本一致
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -51,12 +63,54 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           echo "package.json = $version / tag = $tag"
           if [ "$version" != "$tag" ]; then
-            echo "::error::tag 与 package.json 的 version 不一致，拒绝发布"
+            echo "::error::tag($tag) 与 package.json 的 version($version) 不一致，拒绝发布"
             exit 1
           fi
 
-      - name: 构建 + 加载期校验 + 单元测试
-        run: npm run check
+      - name: 构建 lib/
+        shell: bash
+        run: |
+          set -o pipefail
+          if npm run build > build.log 2>&1; then
+            cat build.log
+          else
+            echo "::error::npm run build 失败"
+            tail -n 25 build.log | sed 's/^/::error::/'
+            exit 1
+          fi
+
+      - name: 加载期校验（产物形状）
+        shell: bash
+        run: |
+          set -o pipefail
+          if node scripts/verify.mjs > verify.log 2>&1; then
+            tail -n 3 verify.log
+          else
+            echo "::error::scripts/verify.mjs 失败"
+            tail -n 25 verify.log | sed 's/^/::error::/'
+            exit 1
+          fi
+
+      - name: 单元测试
+        shell: bash
+        run: |
+          set -o pipefail
+          if node --test tests/ > test.log 2>&1; then
+            grep -E '^# (tests|pass|fail)' test.log || tail -n 5 test.log
+          else
+            echo "::error::node --test tests/ 失败"
+            tail -n 30 test.log | sed 's/^/::error::/'
+            exit 1
+          fi
 
       - name: 发布
-        run: npm publish --provenance --access public --registry https://registry.npmjs.org/
+        shell: bash
+        run: |
+          set -o pipefail
+          if npm publish --provenance --access public --registry https://registry.npmjs.org/ > publish.log 2>&1; then
+            tail -n 6 publish.log
+          else
+            echo "::error::npm publish 失败"
+            tail -n 30 publish.log | sed 's/^/::error::/'
+            exit 1
+          fi
