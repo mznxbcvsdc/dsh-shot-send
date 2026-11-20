@@ -95,10 +95,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          if node --test tests/ > test.log 2>&1; then
-            grep -E '^# (tests|pass|fail)' test.log || tail -n 5 test.log
+          # 不带参数走自动发现：Node 24 的 runner 会把 `tests/` 当模块去 require，
+          # 报 Cannot find module ...\tests。
+          if node --test > test.log 2>&1; then
+            tail -n 8 test.log
           else
-            echo "::error::node --test tests/ 失败"
+            echo "::error::node --test 失败"
             tail -n 30 test.log | sed 's/^/::error::/'
             exit 1
           fi

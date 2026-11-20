@@ -46,8 +46,8 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "verify": "node scripts/verify.mjs",
-    "test": "node --test tests/",
-    "check": "node scripts/build.mjs && node scripts/verify.mjs && node --test tests/"
+    "test": "node --test",
+    "check": "node scripts/build.mjs && node scripts/verify.mjs && node --test"
   },
   "engines": {
     "node": "^22.19 || >=24",
